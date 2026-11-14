@@ -42,6 +42,7 @@ let vadTimer = null;
 let lastLoud = 0;
 
 const $ = (id) => document.getElementById(id);
+const lbl = (b) => b.querySelector('.lbl') || b; // يحدّث نص الزر بدون ما يمسح الأيقونة
 const chatBox = $('chat-box');
 const msgInput = $('msgInput');
 const sendBtn = $('sendBtn');
@@ -89,6 +90,21 @@ function el(tag, cls, text) {
 }
 const initial = (s) => (String(s || '?').trim().charAt(0) || '?').toUpperCase();
 
+const colorOf = (s) => `hsl(${[...String(s)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7)} 55% 52%)`; // لون ثابت لكل اسم
+let lastMsg = { s: '', t: 0 };
+let unread = 0;
+let rooms = [];
+try { rooms = JSON.parse(localStorage.getItem('chat_rooms') || '[]'); } catch {}
+let typingTimer = null;
+let typingSent = 0;
+const closePops = () => document.querySelectorAll('.pop.open').forEach((p) => p.classList.remove('open'));
+
+function toast(text) {
+    const t = el('div', 'toast', text);
+    $('toasts').appendChild(t);
+    setTimeout(() => t.remove(), 3200);
+}
+
 function pushChat(node) {
     chatBox.appendChild(node);
     while (chatBox.childElementCount > 300) chatBox.firstElementChild.remove(); // يحافظ على الرام
@@ -96,6 +112,7 @@ function pushChat(node) {
 }
 
 function sys(text, color = '#949ba4') {
+    lastMsg = { s: '', t: 0 };
     const p = el('p', 'sys', text);
     p.style.color = color;
     pushChat(p);
@@ -106,9 +123,22 @@ function addMsg(sender, text, mine) {
     head.append(el('b', '', sender), el('time', '', new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })));
     const bubble = el('div', 'bubble');
     bubble.append(head, el('div', 'text', text));
-    const row = el('div', mine ? 'msg me' : 'msg');
-    row.append(el('div', 'avatar', initial(sender)), bubble);
+    const cont = lastMsg.s === sender && Date.now() - lastMsg.t < 120000; // رسائل متتالية تنضم تحت اسم واحد
+    lastMsg = { s: sender, t: Date.now() };
+    const row = el('div', 'msg' + (mine ? ' me' : '') + (cont ? ' cont' : ''));
+    const av = el('div', 'avatar', initial(sender));
+    av.style.background = colorOf(sender);
+    head.firstChild.style.setProperty('--c', colorOf(sender));
+    row.append(av, bubble);
     pushChat(row);
+    if (!mine) {
+        $('typing').textContent = '';
+        if (document.hidden || !document.hasFocus()) {
+            unread++;
+            document.title = `(${unread}) شات خفيف ⚡`;
+            sfx('msg');
+        }
+    }
 }
 
 function setLink(text, cls) {
@@ -126,6 +156,10 @@ function renderMembers() {
     if (!list.some((m) => m.id === myId)) list.unshift({ id: myId, name: '' });
     if (peer && !list.some((m) => m.id === peer.id)) list.push({ id: peer.id, name: peer.name });
     roomCountBadge.textContent = list.length;
+    const meEl = $('meAvatar');
+    meEl.textContent = initial(getMyName());
+    meEl.style.background = colorOf(getMyName());
+    meEl.classList.toggle('ring', speaking);
     membersEl.replaceChildren(...list.map((m) => {
         const isMe = m.id === myId;
         const p = !isMe && peer && peer.id === m.id ? peer : null;
@@ -134,7 +168,9 @@ function renderMembers() {
         const info = el('div', 'info');
         info.append(el('span', 'nm', name), el('small', '', isMe ? 'أنت' : p ? 'متصل P2P' : 'في الروم'));
         const li = el('li', st.speaking ? 'member speaking' : 'member');
-        li.append(el('div', 'avatar', initial(name)), info, el('span', '', st.deaf ? '🔕' : st.muted ? '🔇' : ''));
+        const av = el('div', 'avatar', initial(name));
+        av.style.background = colorOf(name);
+        li.append(av, info, el('span', '', st.deaf ? '🔕' : st.muted ? '🔇' : ''));
         return li;
     }));
 }
@@ -150,7 +186,7 @@ function getCtx() {
 }
 document.addEventListener('pointerdown', getCtx, { once: true }); // المتصفح بيسمح بالصوت بعد أول ضغطة
 
-const SFX = { join: [523, 784], connect: [440, 660, 880], mute: [330], unmute: [660], deafen: [330, 247], undeafen: [247, 330] };
+const SFX = { join: [523, 784], connect: [440, 660, 880], mute: [330], unmute: [660], msg: [880, 1175], deafen: [330, 247], undeafen: [247, 330] };
 function sfx(name) {
     try {
         const ctx = getCtx();
@@ -203,7 +239,7 @@ function sendState() {
     dcSend({ t: 'state', muted: isMicMuted, deaf: isDeafened, speaking });
 }
 function sendHello() {
-    dcSend({ t: 'hello', id: myId, name: usernameInput.value.trim() });
+    dcSend({ t: 'hello', id: myId, name: usernameInput.value.trim(), typing: 1 });
     sendState();
 }
 setInterval(() => dcSend({ t: 'ping', ts: Date.now() }), 3000); // قياس البنق عبر القناة
@@ -297,11 +333,95 @@ function applyIsolation() {
 
 nsBtn.onclick = () => {
     noiseIsolation = !noiseIsolation;
-    nsBtn.textContent = noiseIsolation ? 'عزل الضوضاء: شغال 🪄' : 'عزل الضوضاء: مطفي 🪄';
+    lbl(nsBtn).textContent = noiseIsolation ? 'عزل الضوضاء: شغال 🪄' : 'عزل الضوضاء: مطفي 🪄';
     nsBtn.classList.toggle('active', noiseIsolation);
     applyIsolation();
     sys(`عزل الضوضاء: ${noiseIsolation ? 'شغال' : 'مطفي'}`);
 };
+
+// ===== لمسات ديسكورد: شريط الرومات + الإعدادات + الإيموجي + مؤشر الكتابة =====
+function renderRail() {
+    const items = [el('div', 'rbtn logo', '⚡'), el('div', 'rsep')];
+    rooms.forEach((r) => {
+        const b = el('button', r === currentRoom ? 'rbtn on' : 'rbtn', initial(r));
+        b.title = r;
+        b.style.setProperty('--c', colorOf(r));
+        b.onclick = () => {
+            roomInput.value = r;
+            joinRoom();
+            appEl.classList.remove('open');
+        };
+        items.push(b);
+    });
+    const add = el('button', 'rbtn add', '+');
+    add.title = 'روم جديد';
+    add.onclick = () => {
+        appEl.classList.add('open');
+        roomInput.focus();
+        roomInput.select();
+    };
+    $('rail').replaceChildren(...items, add);
+}
+
+const ACCENTS = ['#5865f2', '#3ba55d', '#eb459e', '#f0b232', '#00b0f4', '#f23f43'];
+function setAccent(c) {
+    document.documentElement.style.setProperty('--accent', c);
+    localStorage.setItem('chat_accent', c);
+    document.querySelectorAll('#sws i').forEach((i) => i.classList.toggle('on', i.dataset.c === c));
+}
+function setTheme(t) {
+    document.documentElement.dataset.theme = t;
+    localStorage.setItem('chat_theme', t);
+    $('themeBtn').classList.toggle('active', t === 'midnight');
+}
+
+function showTyping() {
+    $('typing').textContent = `${(peer && peer.name) || 'صاحبك'} يكتب...`;
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => ($('typing').textContent = ''), 3000);
+}
+
+function initUI() {
+    ACCENTS.forEach((c) => {
+        const i = el('i');
+        i.style.background = c;
+        i.dataset.c = c;
+        i.onclick = () => setAccent(c);
+        $('sws').appendChild(i);
+    });
+    setAccent(localStorage.getItem('chat_accent') || ACCENTS[0]);
+    setTheme(localStorage.getItem('chat_theme') || 'dark');
+    $('themeBtn').onclick = () => setTheme(document.documentElement.dataset.theme === 'midnight' ? 'dark' : 'midnight');
+    for (const [b, p] of [['settingsBtn', 'settingsPop'], ['emojiBtn', 'emojiPop']]) {
+        $(b).onclick = (e) => {
+            e.stopPropagation();
+            const open = !$(p).classList.contains('open');
+            closePops();
+            $(p).classList.toggle('open', open);
+        };
+    }
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('.pop')) closePops();
+    });
+    '😀 😂 🥹 😍 😎 🤔 😭 😡 👍 👎 🙏 👏 🔥 💯 ❤️ 🎉 😴 🤝 👀 ✨ 🎮 🎧 💀 🤣 😅 🙌 😮 😉 🥳 😬 🤯 👋'.split(' ').forEach((e) => {
+        const b = el('button', '', e);
+        b.onclick = () => {
+            msgInput.value += e;
+            msgInput.focus();
+        };
+        $('eg').appendChild(b);
+    });
+    msgInput.addEventListener('input', () => {
+        if (peer && peer.typing && Date.now() - typingSent > 2500) {
+            typingSent = Date.now();
+            dcSend({ t: 'typing' });
+        }
+    });
+    window.addEventListener('focus', () => {
+        unread = 0;
+        document.title = 'شات خفيف ⚡';
+    });
+}
 
 async function loadIceConfiguration() {
     try {
@@ -327,13 +447,16 @@ function sendJoin() {
 
 function joinRoom() {
     const room = roomInput.value.trim();
-    if (!room) return alert('اكتب اسم الروم أولاً!');
+    if (!room) return toast('اكتب اسم الروم أولاً!');
     localStorage.setItem('chat_room', room);
     if (room !== currentRoom) {
         roomMembers = [];
         lastCount = 0;
     }
     currentRoom = room;
+    if (!rooms.includes(room)) rooms = [...rooms, room].slice(-12);
+    localStorage.setItem('chat_rooms', JSON.stringify(rooms));
+    renderRail();
     $('roomName').textContent = room;
     $('topRoom').textContent = room;
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -471,7 +594,7 @@ async function createPeerConnection() {
         } else if (state === 'connected') {
             clearTimeout(connectTimeout);
             setLink('متصل P2P', 'online');
-            startBtn.textContent = 'متصل بنجاح ✅';
+            lbl(startBtn).textContent = 'متصل بنجاح ✅';
             startBtn.classList.add('active');
             startBtn.disabled = true;
             sys('✅ تم الاتصال المباشر بنجاح!', '#4ade80');
@@ -480,7 +603,7 @@ async function createPeerConnection() {
             setLink('غير متصل', '');
             pingEl.textContent = '— ms';
             pingEl.className = 'badge';
-            startBtn.textContent = 'اتصال P2P ⚡';
+            lbl(startBtn).textContent = 'اتصال P2P ⚡';
             startBtn.classList.remove('active');
             startBtn.disabled = false;
             sys('انقطع الاتصال المباشر.', '#f87171');
@@ -526,11 +649,13 @@ function setupDataChannel() {
         let msg;
         try { msg = JSON.parse(e.data); } catch { return addMsg('صاحبك', e.data, false); }
         if (msg.t === 'hello') {
-            peer = { id: msg.id, name: msg.name, muted: true, deaf: false, speaking: false };
+            peer = { id: msg.id, name: msg.name, muted: true, deaf: false, speaking: false, typing: !!msg.typing };
             renderMembers();
         } else if (msg.t === 'state') {
             if (peer) Object.assign(peer, { muted: msg.muted, deaf: msg.deaf, speaking: msg.speaking });
             renderMembers();
+        } else if (msg.t === 'typing') {
+            showTyping();
         } else if (msg.t === 'ping') {
             dcSend({ t: 'pong', ts: msg.ts });
         } else if (msg.t === 'pong') {
@@ -573,7 +698,7 @@ startBtn.onclick = async () => {
 
 // ===== 3. المايك + ميوت السماعة (Deafen) =====
 function updateMicUI() {
-    micBtn.textContent = isMicMuted ? 'المايك: ميوت 🔇' : 'المايك: شغال 🎙️';
+    lbl(micBtn).textContent = isMicMuted ? 'المايك: ميوت 🔇' : 'المايك: شغال 🎙️';
     micBtn.classList.toggle('danger', isMicMuted);
     micBtn.classList.toggle('active', !isMicMuted);
     renderMembers();
@@ -597,7 +722,7 @@ micBtn.onclick = async () => {
             updateMicUI();
             sfx('unmute');
         } catch {
-            alert('تأكد من صلاحية المايكروفون!');
+            toast('تأكد من صلاحية المايكروفون!');
         }
     } else {
         isMicMuted = !isMicMuted;
@@ -613,7 +738,7 @@ deafenBtn.onclick = () => {
     remoteVideo.muted = isDeafened || streamMuted;
 
     if (isDeafened) {
-        deafenBtn.textContent = 'السماعة: ميوت 🔕';
+        lbl(deafenBtn).textContent = 'السماعة: ميوت 🔕';
         deafenBtn.classList.add('danger');
         micStateBeforeDeafen = isMicMuted;
         if (!isMicMuted && micStream) {
@@ -623,7 +748,7 @@ deafenBtn.onclick = () => {
         }
         sys('تم كتم السماعة والمايك (Deafen).');
     } else {
-        deafenBtn.textContent = 'السماعة: شغالة 🎧';
+        lbl(deafenBtn).textContent = 'السماعة: شغالة 🎧';
         deafenBtn.classList.remove('danger');
         if (!micStateBeforeDeafen && micStream) {
             isMicMuted = false;
@@ -650,7 +775,7 @@ async function stopScreenShare() {
         screenStream = null;
         screenSender = null;
         screenAudioSender = null;
-        screenBtn.textContent = 'الشاشة: مطفي 🖥️';
+        lbl(screenBtn).textContent = 'الشاشة: مطفي 🖥️';
         screenBtn.classList.remove('active');
         sendSignal({ stopVideo: true });
         await updateConnection();
@@ -667,7 +792,7 @@ screenBtn.onclick = async () => {
                 await updateConnection();
             }
             track.onended = () => stopScreenShare();
-            screenBtn.textContent = 'الشاشة: يبث 🔴';
+            lbl(screenBtn).textContent = 'الشاشة: يبث 🔴';
             screenBtn.classList.add('active');
         } catch {}
     } else {
@@ -703,5 +828,7 @@ msgInput.addEventListener('keydown', (e) => {
 });
 
 renderMembers();
+renderRail();
+initUI();
 connectWebSocket();
 // === نهاية الكود ===
