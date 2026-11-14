@@ -9,6 +9,10 @@ const fallbackIceServers = [
 const VAD_THRESHOLD = 0.03; // حساسية كشف الصوت (صغّرها لو المايك ضعيف)
 const VAD_HOLD_MS = 350;    // كم تبقى الحلقة الخضراء بعد ما توقف عن الكلام
 
+// إعدادات الضاغط الديناميكي: [threshold dB, knee dB, ratio, attack s, release s]
+const COMP_TX = [-14, 10, 6, 0.003, 0.2]; // المايك: يمنع تشويش الأصوات العالية المفاجئة
+const COMP_RX = [-22, 20, 3, 0.01, 0.25]; // صوت صاحبك: يوازن الارتفاع والانخفاض
+
 let ws = null;
 let currentRoom = null;
 let peerConnection = null;
@@ -22,6 +26,10 @@ let screenStream = null;
 let screenSender = null;
 let screenAudioSender = null;
 let streamMuted = false;
+let micOut = null; // المايك بعد الفلاتر (هذا اللي بينرسل للـ RTCPeerConnection)
+let tx = null; // مسار المايك الصادر
+let rx = null; // مسار صوت صاحبك الوارد
+let noiseIsolation = true; // عزل الضوضاء (شغال افتراضياً)
 let pendingCandidates = [];
 let connectTimeout = null;
 let myId = Math.random().toString(36).slice(2, 8); // يتبدّل برقم السيرفر أول ما يتصل
@@ -55,6 +63,7 @@ const linkText = $('linkText');
 const pingEl = $('ping');
 const membersEl = $('members');
 const copyBtn = $('copyBtn');
+const nsBtn = $('nsBtn');
 const appEl = $('app');
 
 // حفظ واسترجاع الاسم والروم تلقائياً
@@ -132,7 +141,10 @@ function renderMembers() {
 
 // ===== مؤثرات صوتية (Web Audio بدون ملفات) =====
 function getCtx() {
-    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!actx) {
+        actx = new (window.AudioContext || window.webkitAudioContext)();
+        actx.onstatechange = applyRemoteAudio; // لو الصوت انفتح متأخر (بعد أول ضغطة) يتحوّل للمسار المُصفّى
+    }
     if (actx.state === 'suspended') actx.resume();
     return actx;
 }
@@ -160,13 +172,13 @@ function sfx(name) {
 }
 
 // ===== كشف التحدث (VAD) + مزامنة الحالة عبر DataChannel =====
-function startVAD(stream) {
+function startVAD(node) { // node = الصوت المُصفّى المُرسل
     clearInterval(vadTimer);
     const ctx = getCtx();
     const analyser = ctx.createAnalyser();
     const buf = new Uint8Array(512);
     analyser.fftSize = 512;
-    ctx.createMediaStreamSource(stream).connect(analyser); // للتحليل فقط، مش متوصل بالسماعات
+    node.connect(analyser); // للتحليل فقط، مش متوصل بالسماعات
     vadTimer = setInterval(() => {
         analyser.getByteTimeDomainData(buf);
         let sum = 0;
@@ -195,6 +207,101 @@ function sendHello() {
     sendState();
 }
 setInterval(() => dcSend({ t: 'ping', ts: Date.now() }), 3000); // قياس البنق عبر القناة
+
+// ===== عزل الضوضاء وتحسين الجودة (Web Audio) =====
+function makeComp(ctx, [threshold, knee, ratio, attack, release]) {
+    const n = ctx.createDynamicsCompressor();
+    n.threshold.value = threshold;
+    n.knee.value = knee;
+    n.ratio.value = ratio;
+    n.attack.value = attack;
+    n.release.value = release;
+    return n;
+}
+
+// الصادر: مايك > highpass 85Hz > ضاغط > (يُرسل للـ RTCPeerConnection + يقرأ منه الـ VAD)
+function setupMicChain(stream) {
+    const ctx = getCtx();
+    const src = ctx.createMediaStreamSource(stream);
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 85; // يقص طنين المراوح والمكيفات
+    const comp = makeComp(ctx, COMP_TX);
+    const proc = ctx.createGain(); // المسار المُصفّى
+    const raw = ctx.createGain(); // المسار الخام (لما العزل يكون مطفي، للمقارنة)
+    const mix = ctx.createGain();
+    const dest = ctx.createMediaStreamDestination();
+    proc.gain.value = noiseIsolation ? 1 : 0;
+    raw.gain.value = noiseIsolation ? 0 : 1;
+    src.connect(hp);
+    hp.connect(comp);
+    comp.connect(proc);
+    proc.connect(mix);
+    src.connect(raw);
+    raw.connect(mix);
+    mix.connect(dest); // مش متوصل بالسماعات أبداً، فما في صدى من صوتك
+    tx = { proc, raw };
+    micOut = dest.stream;
+    startVAD(mix); // الـ VAD يقرأ من نفس الصوت المُرسل (المُصفّى) فما يضوي من صوت المكيف
+}
+
+// الوارد: صوت صاحبك > highpass 100Hz > lowpass 7500Hz > ضاغط > gain (Deafen + Volume) > السماعات
+function setupRemoteChain(stream) {
+    if (rx) {
+        rx.src.disconnect();
+        rx.out.disconnect();
+        rx = null;
+    }
+    try {
+        const ctx = getCtx();
+        const src = ctx.createMediaStreamSource(stream);
+        const hp = ctx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = 100; // يقص المكيف والضجيج المنخفض
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = 7500; // يقص الصفير والتشويش الحاد
+        const comp = makeComp(ctx, COMP_RX);
+        const out = ctx.createGain();
+        out.gain.value = 0;
+        src.connect(hp);
+        hp.connect(lp);
+        lp.connect(comp);
+        comp.connect(out);
+        out.connect(ctx.destination);
+        rx = { src, out };
+    } catch {
+        rx = null; // لو فشل: يشتغل الصوت العادي من عنصر الـ audio
+    }
+}
+
+// مصدر صوت واحد بس يشتغل بكل لحظة (المُصفّى أو العادي) عشان ما يصير صدى مزدوج
+function applyRemoteAudio() {
+    const vol = Number(volumeSlider.value);
+    const viaChain = noiseIsolation && !!rx && !!actx && actx.state === 'running';
+    remoteAudio.muted = viaChain || isDeafened;
+    remoteAudio.volume = vol;
+    if (rx) rx.out.gain.setTargetAtTime(viaChain && !isDeafened ? vol : 0, actx.currentTime, 0.02);
+}
+
+function applyIsolation() {
+    if (tx) {
+        const t = actx.currentTime;
+        tx.proc.gain.setTargetAtTime(noiseIsolation ? 1 : 0, t, 0.02);
+        tx.raw.gain.setTargetAtTime(noiseIsolation ? 0 : 1, t, 0.02);
+    }
+    const track = micStream && micStream.getAudioTracks()[0];
+    if (track) track.applyConstraints({ echoCancellation: true, noiseSuppression: noiseIsolation, autoGainControl: noiseIsolation }).catch(() => {});
+    applyRemoteAudio();
+}
+
+nsBtn.onclick = () => {
+    noiseIsolation = !noiseIsolation;
+    nsBtn.textContent = noiseIsolation ? 'عزل الضوضاء: شغال 🪄' : 'عزل الضوضاء: مطفي 🪄';
+    nsBtn.classList.toggle('active', noiseIsolation);
+    applyIsolation();
+    sys(`عزل الضوضاء: ${noiseIsolation ? 'شغال' : 'مطفي'}`);
+};
 
 async function loadIceConfiguration() {
     try {
@@ -347,9 +454,9 @@ async function createPeerConnection() {
     }
     peerConnection = new RTCPeerConnection(await iceConfigPromise);
 
-    if (micStream) {
-        const track = micStream.getAudioTracks()[0];
-        if (track) micSender = peerConnection.addTrack(track, micStream);
+    if (micOut) {
+        const track = micOut.getAudioTracks()[0]; // المايك المُصفّى (مش الخام)
+        if (track) micSender = peerConnection.addTrack(track, micOut);
     }
     if (screenStream) addScreenTracks();
 
@@ -390,6 +497,8 @@ async function createPeerConnection() {
             videoContainer.style.display = 'flex';
             streamAudioBtn.hidden = !stream.getAudioTracks().length;
         } else {
+            setupRemoteChain(stream); // يمرّر الصوت الوارد بفلاتر قبل السماعة
+            applyRemoteAudio();
             remoteAudio.srcObject = stream; // صوت المايك
         }
     };
@@ -475,14 +584,16 @@ micBtn.onclick = async () => {
     if (isDeafened) return; // ممنوع تفتح المايك وانت عامل ميوت للسماعة زي ديسكورد
     if (!micStream) {
         try {
-            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            micStream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: noiseIsolation, autoGainControl: noiseIsolation }
+            });
             isMicMuted = false;
-            const track = micStream.getAudioTracks()[0];
+            setupMicChain(micStream); // مايك > فلتر > ضاغط > (إرسال + VAD)
+            const track = micOut.getAudioTracks()[0];
             if (peerConnection && peerConnection.connectionState === 'connected') {
-                micSender = peerConnection.addTrack(track, micStream);
+                micSender = peerConnection.addTrack(track, micOut);
                 await updateConnection();
             }
-            startVAD(micStream);
             updateMicUI();
             sfx('unmute');
         } catch {
@@ -498,7 +609,7 @@ micBtn.onclick = async () => {
 
 deafenBtn.onclick = () => {
     isDeafened = !isDeafened;
-    remoteAudio.muted = isDeafened;
+    applyRemoteAudio();
     remoteVideo.muted = isDeafened || streamMuted;
 
     if (isDeafened) {
@@ -527,7 +638,7 @@ deafenBtn.onclick = () => {
 };
 
 volumeSlider.oninput = () => {
-    remoteAudio.volume = volumeSlider.value;
+    applyRemoteAudio(); // نفس الشريط يتحكم بالمسار المُصفّى (أو العنصر العادي)
     remoteVideo.volume = volumeSlider.value;
 };
 
